@@ -81,146 +81,129 @@ async function checkProducts() {
     console.log(`[${formatTime()}] S: Start`);
 
     let browser;
-    try {
-        console.log(`[${formatTime()}] S: Resolving Executable Path`);
-        let executablePath = null;
-        if (process.env.NODE_ENV === 'development') {
-            executablePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
-        } else {
-            // Vercel/Prod
-            executablePath = await chromium.executablePath();
+    headless: process.env.NODE_ENV === 'production' ? chromium.headless : true,
+        });
+
+const page = await browser.newPage();
+
+// Bloat blocking
+await page.setRequestInterception(true);
+page.on('request', (req) => {
+    if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+        req.abort();
+    } else {
+        req.continue();
+    }
+});
+
+console.log(`[${formatTime()}] S: Navigating`);
+await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+console.log(`[${formatTime()}] S: Scrolling`);
+await autoScroll(page);
+
+// Parse page
+console.log(`[${formatTime()}] S: Parsing`);
+const products: Record<string, ProductData> = await page.evaluate(() => {
+    const results: Record<string, ProductData> = {};
+    const blocks = document.querySelectorAll('.list_block');
+
+    blocks.forEach((block) => {
+        try {
+            const linkTag = block.querySelector('a[href]') as HTMLAnchorElement;
+            if (!linkTag) return;
+            const href = linkTag.href;
+
+            const titleTag = block.querySelector('a[title]') as HTMLAnchorElement;
+            let name = titleTag ? titleTag.title : linkTag.innerText.trim();
+            if (!name) {
+                const img = block.querySelector('img[alt]') as HTMLImageElement;
+                if (img) name = img.alt;
+            }
+
+            const addToCartBtn = block.querySelector('.ga_bn_btn_addcart');
+            const blockText = (block as HTMLElement).innerText.toLowerCase();
+            const textIndicatesOOS = blockText.includes('out of stock') || blockText.includes('sold out') || blockText.includes('notify me');
+
+            const isInStock = !!addToCartBtn && !textIndicatesOOS;
+
+            // Image might be missing due to blocking, use placeholder or data-src
+            results[href] = {
+                name,
+                in_stock: isInStock,
+                link: href,
+                image: '' // No images saves bandwidth
+            };
+        } catch (e) { }
+    });
+    return results;
+});
+
+console.log(`[${formatTime()}] S: Found ${Object.keys(products).length} items`);
+
+// Process Updates
+const currentAlerts = [...store.state.alerts];
+const currentMonitored = [...store.state.monitored_products];
+const newProducts = products;
+
+Object.entries(newProducts).forEach(([pid, data]) => {
+    if (!seenProducts[pid]) {
+        // NEW Item
+        if (!firstRun && data.in_stock) {
+            const isDuplicate = currentAlerts.some(a => a.link === data.link && a.type === 'NEW');
+            if (!isDuplicate) {
+                const alert: Alert = { type: 'NEW', message: `New Product: ${data.name}`, link: data.link, time: formatTime() };
+                currentAlerts.unshift(alert);
+                if (currentAlerts.length > 50) currentAlerts.pop();
+
+                if (!currentMonitored.some(p => p.link === data.link)) {
+                    currentMonitored.unshift({ ...data, alert_type: 'NEW', alert_time: formatTime() });
+                    if (currentMonitored.length > 20) currentMonitored.pop();
+                }
+            }
         }
+        seenProducts[pid] = data;
+    } else {
+        const oldData = seenProducts[pid];
+        if (!oldData.in_stock && data.in_stock) {
+            const isDuplicate = currentAlerts.some(a => a.link === data.link && a.type === 'STOCK');
+            if (!isDuplicate) {
+                const alert: Alert = { type: 'STOCK', message: `Back in Stock: ${data.name}`, link: data.link, time: formatTime() };
+                currentAlerts.unshift(alert);
+                if (currentAlerts.length > 50) currentAlerts.pop();
 
-        console.log(`[${formatTime()}] S: Path Resolved: ${executablePath ? 'Yes' : 'No'}`);
-        console.log(`[${formatTime()}] S: Launching`);
-
-        browser = await puppeteer.launch({
-            args: process.env.NODE_ENV === 'production' ? chromium.args : [],
-            defaultViewport: { width: 1920, height: 1080 },
-            executablePath: executablePath || undefined,
-            headless: process.env.NODE_ENV === 'production' ? chromium.headless : true,
-        });
-
-        const page = await browser.newPage();
-
-        // Bloat blocking
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-                req.abort();
-            } else {
-                req.continue();
-            }
-        });
-
-        console.log(`[${formatTime()}] S: Navigating`);
-        await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-        console.log(`[${formatTime()}] S: Scrolling`);
-        await autoScroll(page);
-
-        // Parse page
-        console.log(`[${formatTime()}] S: Parsing`);
-        const products: Record<string, ProductData> = await page.evaluate(() => {
-            const results: Record<string, ProductData> = {};
-            const blocks = document.querySelectorAll('.list_block');
-
-            blocks.forEach((block) => {
-                try {
-                    const linkTag = block.querySelector('a[href]') as HTMLAnchorElement;
-                    if (!linkTag) return;
-                    const href = linkTag.href;
-
-                    const titleTag = block.querySelector('a[title]') as HTMLAnchorElement;
-                    let name = titleTag ? titleTag.title : linkTag.innerText.trim();
-                    if (!name) {
-                        const img = block.querySelector('img[alt]') as HTMLImageElement;
-                        if (img) name = img.alt;
-                    }
-
-                    const addToCartBtn = block.querySelector('.ga_bn_btn_addcart');
-                    const blockText = (block as HTMLElement).innerText.toLowerCase();
-                    const textIndicatesOOS = blockText.includes('out of stock') || blockText.includes('sold out') || blockText.includes('notify me');
-
-                    const isInStock = !!addToCartBtn && !textIndicatesOOS;
-
-                    // Image might be missing due to blocking, use placeholder or data-src
-                    results[href] = {
-                        name,
-                        in_stock: isInStock,
-                        link: href,
-                        image: '' // No images saves bandwidth
-                    };
-                } catch (e) { }
-            });
-            return results;
-        });
-
-        console.log(`[${formatTime()}] S: Found ${Object.keys(products).length} items`);
-
-        // Process Updates
-        const currentAlerts = [...store.state.alerts];
-        const currentMonitored = [...store.state.monitored_products];
-        const newProducts = products;
-
-        Object.entries(newProducts).forEach(([pid, data]) => {
-            if (!seenProducts[pid]) {
-                // NEW Item
-                if (!firstRun && data.in_stock) {
-                    const isDuplicate = currentAlerts.some(a => a.link === data.link && a.type === 'NEW');
-                    if (!isDuplicate) {
-                        const alert: Alert = { type: 'NEW', message: `New Product: ${data.name}`, link: data.link, time: formatTime() };
-                        currentAlerts.unshift(alert);
-                        if (currentAlerts.length > 50) currentAlerts.pop();
-
-                        if (!currentMonitored.some(p => p.link === data.link)) {
-                            currentMonitored.unshift({ ...data, alert_type: 'NEW', alert_time: formatTime() });
-                            if (currentMonitored.length > 20) currentMonitored.pop();
-                        }
-                    }
+                if (!currentMonitored.some(p => p.link === data.link)) {
+                    currentMonitored.unshift({ ...data, alert_type: 'STOCK', alert_time: formatTime() });
+                    if (currentMonitored.length > 20) currentMonitored.pop();
                 }
-                seenProducts[pid] = data;
-            } else {
-                const oldData = seenProducts[pid];
-                if (!oldData.in_stock && data.in_stock) {
-                    const isDuplicate = currentAlerts.some(a => a.link === data.link && a.type === 'STOCK');
-                    if (!isDuplicate) {
-                        const alert: Alert = { type: 'STOCK', message: `Back in Stock: ${data.name}`, link: data.link, time: formatTime() };
-                        currentAlerts.unshift(alert);
-                        if (currentAlerts.length > 50) currentAlerts.pop();
-
-                        if (!currentMonitored.some(p => p.link === data.link)) {
-                            currentMonitored.unshift({ ...data, alert_type: 'STOCK', alert_time: formatTime() });
-                            if (currentMonitored.length > 20) currentMonitored.pop();
-                        }
-                    }
-                }
-                seenProducts[pid] = data;
             }
-        });
+        }
+        seenProducts[pid] = data;
+    }
+});
 
-        const filteredMonitored = currentMonitored.filter(p => {
-            return newProducts[p.link] && newProducts[p.link].in_stock;
-        });
+const filteredMonitored = currentMonitored.filter(p => {
+    return newProducts[p.link] && newProducts[p.link].in_stock;
+});
 
-        store.update({
-            current_products: newProducts,
-            alerts: currentAlerts,
-            monitored_products: filteredMonitored,
-            last_updated: new Date().toLocaleString(),
-            is_scraping: false
-        });
+store.update({
+    current_products: newProducts,
+    alerts: currentAlerts,
+    monitored_products: filteredMonitored,
+    last_updated: new Date().toLocaleString(),
+    is_scraping: false
+});
 
-        firstRun = false;
-        console.log(`[${formatTime()}] S: Done`);
+firstRun = false;
+console.log(`[${formatTime()}] S: Done`);
 
     } catch (error) {
-        console.error("Error in scraper:", error);
-        store.update({ is_scraping: false, last_updated: "Error: Failed" });
-    } finally {
-        if (browser) await browser.close();
-        isRunning = false;
-    }
+    console.error("Error in scraper:", error);
+    store.update({ is_scraping: false, last_updated: "Error: Failed" });
+} finally {
+    if (browser) await browser.close();
+    isRunning = false;
+}
 }
 
 async function autoScroll(page: any) {

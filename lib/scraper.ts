@@ -67,14 +67,14 @@ export async function startScraper() {
 
     // Race condition to prevent hanging
     const timeout = new Promise<void>((_, reject) =>
-        setTimeout(() => reject(new Error("Scrape timeout")), 25000)
+        setTimeout(() => reject(new Error("Scrape timeout")), 55000)
     );
 
     try {
         await Promise.race([checkProducts(), timeout]);
     } catch (e) {
         console.error("Scrape timed out or failed:", e);
-        store.update({ is_scraping: false });
+        store.update({ is_scraping: false, last_updated: "Error: Timeout" });
     }
 }
 
@@ -82,7 +82,7 @@ async function checkProducts() {
     if (isRunning) return;
     isRunning = true;
     store.update({ is_scraping: true, last_updated: "Checking..." }); // Immediate feedback
-    console.log(`Scraping... ${formatTime()}`);
+    console.log(`[${formatTime()}] S: Start`);
 
     let browser;
     try {
@@ -91,20 +91,34 @@ async function checkProducts() {
             executablePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
         }
 
+        console.log(`[${formatTime()}] S: Launching`);
         browser = await puppeteer.launch({
             args: process.env.NODE_ENV === 'production' ? chromium.args : minimalArgs,
             defaultViewport: { width: 1920, height: 1080 },
-            executablePath: executablePath || undefined, // undefined lets puppeteer look if not provided
-            headless: process.env.NODE_ENV === 'production' ? chromium.headless : true, // Use chromium.headless for prod
+            executablePath: executablePath || undefined,
+            headless: process.env.NODE_ENV === 'production' ? chromium.headless : true,
         });
 
         const page = await browser.newPage();
 
+        // Bloat blocking
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
+        console.log(`[${formatTime()}] S: Navigating`);
         await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
+        console.log(`[${formatTime()}] S: Scrolling`);
         await autoScroll(page);
 
         // Parse page
+        console.log(`[${formatTime()}] S: Parsing`);
         const products: Record<string, ProductData> = await page.evaluate(() => {
             const results: Record<string, ProductData> = {};
             const blocks = document.querySelectorAll('.list_block');
@@ -117,7 +131,6 @@ async function checkProducts() {
 
                     const titleTag = block.querySelector('a[title]') as HTMLAnchorElement;
                     let name = titleTag ? titleTag.title : linkTag.innerText.trim();
-
                     if (!name) {
                         const img = block.querySelector('img[alt]') as HTMLImageElement;
                         if (img) name = img.alt;
@@ -129,21 +142,19 @@ async function checkProducts() {
 
                     const isInStock = !!addToCartBtn && !textIndicatesOOS;
 
-                    const imgTag = block.querySelector('img[src]') as HTMLImageElement;
-                    const imageUrl = imgTag ? imgTag.src : '';
-
+                    // Image might be missing due to blocking, use placeholder or data-src
                     results[href] = {
                         name,
                         in_stock: isInStock,
                         link: href,
-                        image: imageUrl
+                        image: '' // No images saves bandwidth
                     };
-                } catch (e) {
-                    // Ignore
-                }
+                } catch (e) { }
             });
             return results;
         });
+
+        console.log(`[${formatTime()}] S: Found ${Object.keys(products).length} items`);
 
         // Process Updates
         const currentAlerts = [...store.state.alerts];
@@ -154,24 +165,14 @@ async function checkProducts() {
             if (!seenProducts[pid]) {
                 // NEW Item
                 if (!firstRun && data.in_stock) {
-                    // Check dupes
                     const isDuplicate = currentAlerts.some(a => a.link === data.link && a.type === 'NEW');
                     if (!isDuplicate) {
-                        const alert: Alert = {
-                            type: 'NEW',
-                            message: `New Product: ${data.name}`,
-                            link: data.link,
-                            time: formatTime()
-                        };
+                        const alert: Alert = { type: 'NEW', message: `New Product: ${data.name}`, link: data.link, time: formatTime() };
                         currentAlerts.unshift(alert);
                         if (currentAlerts.length > 50) currentAlerts.pop();
 
                         if (!currentMonitored.some(p => p.link === data.link)) {
-                            currentMonitored.unshift({
-                                ...data,
-                                alert_type: 'NEW',
-                                alert_time: formatTime()
-                            });
+                            currentMonitored.unshift({ ...data, alert_type: 'NEW', alert_time: formatTime() });
                             if (currentMonitored.length > 20) currentMonitored.pop();
                         }
                     }
@@ -182,21 +183,12 @@ async function checkProducts() {
                 if (!oldData.in_stock && data.in_stock) {
                     const isDuplicate = currentAlerts.some(a => a.link === data.link && a.type === 'STOCK');
                     if (!isDuplicate) {
-                        const alert: Alert = {
-                            type: 'STOCK',
-                            message: `Back in Stock: ${data.name}`,
-                            link: data.link,
-                            time: formatTime()
-                        };
+                        const alert: Alert = { type: 'STOCK', message: `Back in Stock: ${data.name}`, link: data.link, time: formatTime() };
                         currentAlerts.unshift(alert);
                         if (currentAlerts.length > 50) currentAlerts.pop();
 
                         if (!currentMonitored.some(p => p.link === data.link)) {
-                            currentMonitored.unshift({
-                                ...data,
-                                alert_type: 'STOCK',
-                                alert_time: formatTime()
-                            });
+                            currentMonitored.unshift({ ...data, alert_type: 'STOCK', alert_time: formatTime() });
                             if (currentMonitored.length > 20) currentMonitored.pop();
                         }
                     }
@@ -218,10 +210,11 @@ async function checkProducts() {
         });
 
         firstRun = false;
+        console.log(`[${formatTime()}] S: Done`);
 
     } catch (error) {
         console.error("Error in scraper:", error);
-        store.update({ is_scraping: false });
+        store.update({ is_scraping: false, last_updated: "Error: Failed" });
     } finally {
         if (browser) await browser.close();
         isRunning = false;
@@ -229,12 +222,11 @@ async function checkProducts() {
 }
 
 async function autoScroll(page: any) {
-    // Limited scroll for performance
     await page.evaluate(async () => {
         await new Promise<void>((resolve) => {
             let totalHeight = 0;
-            const distance = 300; // Faster scroll
-            const maxScrolls = 20; // Limit depth to avoid timeouts
+            const distance = 800; // Big chunks
+            const maxScrolls = 6;  // Fewer scrolls
             let scrolls = 0;
 
             const timer = setInterval(() => {
@@ -247,7 +239,7 @@ async function autoScroll(page: any) {
                     clearInterval(timer);
                     resolve();
                 }
-            }, 100);
+            }, 200); // Slower interval to let load, but fewer steps
         });
     });
 }

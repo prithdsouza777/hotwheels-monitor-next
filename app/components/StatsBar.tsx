@@ -16,8 +16,10 @@ export default function StatsBar({ totalCount, lastUpdated, isScraping, soundEna
             </div>
             <div className="stat-item">
                 Updated: <span className="stat-value">{lastUpdated}</span>
-                {isScraping && (
-                    <span className="loading-indicator" title="Scraping..."></span>
+                {isScraping ? (
+                    <span className="loading-indicator" title="Monitoring Active - Running all the time"></span>
+                ) : (
+                    <span className="loading-indicator" style={{ background: '#333', animation: 'none' }} title="Waiting for next cycle..."></span>
                 )}
                 <button
                     className={`sound-toggle ${soundEnabled ? 'active' : ''}`}

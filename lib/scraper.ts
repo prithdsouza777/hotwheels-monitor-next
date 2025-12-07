@@ -65,39 +65,37 @@ export async function startScraper() {
     // But we can start the check if it's not running.
     // The state will assume to be "scraping" until finished.
 
-    console.log("Triggering scraper...");
-    // DO NOT await this here if you want non-blocking response, 
-    // but Vercel function might freeze if response ends. 
-    // Ideally, we keep the connection open or use a background job.
-    // For this POC, we await checks on the API route or just fire and hope internal loop runs for a bit.
-    // Better approach for Vercel: Scrape ON DEMAND during the request.
+    // Race condition to prevent hanging
+    const timeout = new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error("Scrape timeout")), 25000)
+    );
 
-    await checkProducts();
+    try {
+        await Promise.race([checkProducts(), timeout]);
+    } catch (e) {
+        console.error("Scrape timed out or failed:", e);
+        store.update({ is_scraping: false });
+    }
 }
 
 async function checkProducts() {
     if (isRunning) return;
     isRunning = true;
-    store.update({ is_scraping: true });
+    store.update({ is_scraping: true, last_updated: "Checking..." }); // Immediate feedback
     console.log(`Scraping... ${formatTime()}`);
 
     let browser;
     try {
-        // Determine executable path
-        // Local development: use local chrome
-        // Production (Vercel): use @sparticuz/chromium
         let executablePath = await chromium.executablePath();
         if (process.env.NODE_ENV === 'development') {
-            // Need to point to a local chrome
-            // For windows user:
             executablePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
         }
 
         browser = await puppeteer.launch({
             args: process.env.NODE_ENV === 'production' ? chromium.args : minimalArgs,
             defaultViewport: { width: 1920, height: 1080 },
-            executablePath: executablePath || await chromium.executablePath(),
-            headless: true,
+            executablePath: executablePath || undefined, // undefined lets puppeteer look if not provided
+            headless: process.env.NODE_ENV === 'production' ? chromium.headless : true, // Use chromium.headless for prod
         });
 
         const page = await browser.newPage();
